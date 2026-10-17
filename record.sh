@@ -23,6 +23,7 @@ ROOT_DIR="$(pwd)"
 RUN_DIR=$(run_dir)
 
 declare -a CHILD_PIDS=()
+declare -a CHILD_NAMES=()
 
 camera_loop() {
   local cam_json="$1"
@@ -64,7 +65,9 @@ cleanup_and_exit() {
     kill -TERM "$pid" 2>/dev/null
   done
   wait
-  rm -f "$RUN_DIR"/*.pid
+  for name in "${CHILD_NAMES[@]}"; do
+    rm -f "$RUN_DIR/$name.pid"
+  done
   log "all recorders stopped"
   exit 0
 }
@@ -84,6 +87,7 @@ for filter in "${name_filter_args[@]}"; do
     camera_loop "$cam_json" &
     pid=$!
     CHILD_PIDS+=("$pid")
+    CHILD_NAMES+=("$name")
     echo "$pid" >"$RUN_DIR/$name.pid"
     log "launched recorder for '$name' (pid $pid)"
   done < <(list_cameras "$filter")

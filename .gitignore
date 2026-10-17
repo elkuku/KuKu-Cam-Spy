@@ -2,6 +2,8 @@ cameras.json
 recordings/
 snapshots/
 run/
+events/
+models/
 *.log
 .venv/
 __pycache__/

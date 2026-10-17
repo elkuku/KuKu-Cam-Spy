@@ -124,6 +124,9 @@ endpoints:
 - `/stream/<camera>`: raw MJPEG stream, usable in `<img src>`, VLC, etc.
 - `/snapshot/<camera>.jpg`: the current frame as a single JPEG
 
+Below the live tiles, the page lists the person events recorded by
+`person_watch.py` (see next section).
+
 Config knobs (top-level, and all but the first two can be overridden per camera):
 
 | Key            | Default     | Meaning                                         |
@@ -143,7 +146,89 @@ internet.
 Browsers allow ~6 simultaneous HTTP/1.1 connections per host and each live
 tile holds one open, so the grid page is practical for up to about 5 cameras.
 
+## Person detection, clips and alerts
+
+`person_watch.py` watches every enabled camera for **people**, whatever the
+camera brand. It decodes a small feed (`detect_width` px wide, `detect_fps`
+frames/s) and runs it through a YOLOX-s object detector (COCO model from the
+[OpenCV model zoo](https://huggingface.co/opencv/object_detection_yolox),
+Apache-2.0) on the CPU. Only the "person" class counts, so trees, shadows,
+cars and animals don't trigger events. The model (36 MB) is downloaded to
+`models/` on first start and its checksum is verified.
+
+For each event it writes to `events/<camera>/`:
+
+- `<id>.jpg`: snapshot with the detected people boxed
+- `<id>.mp4`: clip from `clip_pre_seconds` before the first detection until
+  the person has been gone for `event_end_seconds`, cut without re-encoding
+  from a rolling buffer of the **main** stream (`run/buffer/<camera>/`)
+- `<id>.json`: metadata, which the live-view page reads
+
+It also sends a Telegram photo, plus the clip once it's saved, when
+configured.
+
+```sh
+.venv/bin/pip install -r requirements.txt   # once: adds opencv + numpy
+.venv/bin/python3 person_watch.py              # watch all enabled cameras
+.venv/bin/python3 person_watch.py front_door   # watch just one camera
+./stop.sh                                       # stops this too
+```
+
+**Web page notifications:** when `stream_server.py` runs, the live page lists
+recent events (click one to play its clip). A camera tile gets a red outline
+while a person is in view, and a pop-up appears for each new event. Click
+"Enable desktop notifications" for OS notifications as well. Browsers only
+allow these on `localhost`/HTTPS, so over a plain-HTTP LAN address you get
+the in-page pop-up only.
+
+**Telegram:**
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy its token.
+2. Send your bot any message, then open
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` and copy `chat.id`.
+3. `export TELEGRAM_BOT_TOKEN='123456:ABC...'`, then set `telegram_enabled`
+   and `telegram_chat_id` in `cameras.json`.
+
+Settings are top-level defaults, and each one can be overridden per camera:
+
+| Key                      | Default              | Meaning |
+|--------------------------|----------------------|---------|
+| `person_detection`       | `true`               | Set `false` on a camera to skip it |
+| `detect_path`            | `stream_path`/`path` | RTSP path analysed; use the substream |
+| `detect_fps`             | `2`                  | Frames per second analysed |
+| `detect_width`           | `640`                | Width of analysed frames and snapshots |
+| `detect_min_score`       | `0.6`                | Confidence threshold (0–1); raise it if you get false alarms |
+| `detect_min_frames`      | `2`                  | Consecutive frames with a person needed to start an event |
+| `event_end_seconds`      | `10`                 | Event ends after no person for this long |
+| `event_max_seconds`      | `120`                | Split events longer than this |
+| `clip_enabled`           | `true`               | Keep a video clip per event |
+| `clip_pre_seconds`       | `5`                  | Video kept from before the first detection |
+| `telegram_enabled`       | `false`              | Send events to Telegram |
+| `telegram_chat_id`       | –                    | Chat/user/group id to send to |
+| `telegram_bot_token_env` | `TELEGRAM_BOT_TOKEN` | Env var holding the bot token |
+| `telegram_send_clip`     | `true`               | Also send the clip (when under Telegram's 50 MB limit) |
+
+Notes:
+
+- **CPU:** one detection takes ~45 ms on a modern desktop CPU (more on a
+  Raspberry Pi), so 2 fps × a handful of cameras is light. Lower
+  `detect_fps` on slow machines.
+- **RTSP connections:** each camera can get up to four connections at once:
+  `record.sh` (main), the clip buffer (main), detection (sub) and live view
+  (sub). Some cameras limit concurrent sessions, and when that limit is hit
+  ffmpeg reports `Error opening input: Operation not permitted`. Some Tapo
+  models, for example, accept only **one** client on `/stream1` but several
+  on `/stream2`. So always set `stream_path` to the substream; then live view
+  and detection share it, and `/stream1` is left for one consumer. That's
+  either the clip buffer or `record.sh`, not both: if you run `record.sh` on
+  such a camera, set `clip_enabled: false` for it.
+- `cleanup.sh` deletes events older than `retention_days` too.
+
 ## Motion detection (TP-Link / Tapo cameras only)
+
+> For most uses, prefer `person_watch.py` (above): it works on all cameras
+> and only reacts to people. This older script stays for Tapo owners who
+> want the camera's own detector.
 
 `motion_watch.py` polls a Tapo camera's own built-in motion/person detector
 (the camera's own AI/PIR result) via its local control API, instead of

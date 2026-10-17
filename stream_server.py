@@ -6,6 +6,9 @@ HTTP, so any browser can show it in a plain <img> tag. An ffmpeg process is
 only started while at least one viewer is watching that camera, and is shared
 between all viewers.
 
+The page also lists the person-detection events written by person_watch.py
+(snapshots and clips) and alerts when a new one starts.
+
 Usage:
     ./stream_server.py                 # serve all enabled cameras
     ./stream_server.py front_door      # serve just one camera
@@ -17,80 +20,26 @@ cameras.json to change the address).
 
 import html
 import json
-import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
-ROOT_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = Path(os.environ.get("CAMERAS_CONFIG", ROOT_DIR / "cameras.json"))
-RUN_DIR = ROOT_DIR / "run"
+from camlib import (
+    EVENTS_DIR, iter_jpeg_frames, load_config, log, rtsp_input_args,
+    select_cameras, write_pid_file,
+)
+
 BOUNDARY = "kukuframe"
 IDLE_STOP_SECONDS = 10  # keep ffmpeg alive briefly after the last viewer leaves
 RESTART_DELAY_SECONDS = 5
-
-
-def log(cam_name, msg):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [{cam_name}] {msg}", flush=True)
-
-
-def load_config():
-    if not CONFIG_FILE.exists():
-        sys.exit(
-            f"config file not found: {CONFIG_FILE} "
-            "(copy cameras.json.example to cameras.json and edit it)"
-        )
-    with open(CONFIG_FILE) as f:
-        return json.load(f)
-
-
-def select_cameras(config, filters):
-    cameras = [c for c in config.get("cameras", []) if c.get("enabled", True)]
-    if not filters or filters == ["all"]:
-        return cameras
-    by_name = {c["name"]: c for c in cameras}
-    selected = []
-    for name in filters:
-        if name not in by_name:
-            sys.exit(f"no enabled camera named '{name}' in {CONFIG_FILE}")
-        selected.append(by_name[name])
-    return selected
-
-
-def resolve_password(cam):
-    # Same rules as resolve_password() in lib/common.sh.
-    env_var = cam.get("password_env")
-    if env_var:
-        password = os.environ.get(env_var)
-        if not password:
-            sys.exit(
-                f"environment variable '{env_var}' is not set "
-                f"(required for camera {cam['name']})"
-            )
-        return password
-    password = cam.get("password")
-    if not password:
-        sys.exit(f"camera {cam['name']} has no password or password_env set")
-    return password
-
-
-def build_rtsp_url(cam):
-    host = cam.get("host")
-    if not host:
-        sys.exit(f"camera {cam['name']} is missing 'host'")
-    port = cam.get("port", 554)
-    # stream_path lets the live view use a lighter substream (e.g. Tapo
-    # /stream2) while record.sh keeps recording the main stream.
-    path = cam.get("stream_path") or cam.get("path") or "/"
-    user = quote(cam.get("username", ""), safe="")
-    password = quote(resolve_password(cam), safe="")
-    return f"rtsp://{user}:{password}@{host}:{port}{path}"
+EVENTS_PER_CAMERA = 20
+EVENT_FILE_RE = re.compile(r"^[\w-]+\.(jpg|mp4)$")
+CONTENT_TYPES = {"jpg": "image/jpeg", "mp4": "video/mp4"}
 
 
 class CameraStream:
@@ -98,11 +47,9 @@ class CameraStream:
 
     def __init__(self, cam, config):
         self.name = cam["name"]
-        self.input_args = [
-            "-rtsp_transport", config.get("rtsp_transport", "tcp"),
-            "-timeout", "15000000",
-            "-i", build_rtsp_url(cam),
-        ]
+        # stream_path lets the live view use a lighter substream (e.g. Tapo
+        # /stream2) while record.sh keeps recording the main stream.
+        self.input_args = rtsp_input_args(cam, config, cam.get("stream_path"))
         fps = cam.get("stream_fps", config.get("stream_fps", 5))
         width = cam.get("stream_width", config.get("stream_width", 1280))
         self.output_args = [
@@ -164,29 +111,13 @@ class CameraStream:
             stdout=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
         )
-        stopper = threading.Thread(target=self._stop_when_idle, daemon=True)
-        stopper.start()
-        buf = b""
+        threading.Thread(target=self._stop_when_idle, daemon=True).start()
         try:
-            while True:
-                chunk = self.proc.stdout.read1(65536)
-                if not chunk:
-                    break
-                buf += chunk
-                # ffmpeg's MJPEG output has no embedded thumbnails, and 0xFF
-                # bytes in entropy-coded data are stuffed, so SOI/EOI markers
-                # reliably delimit frames.
-                while True:
-                    start = buf.find(b"\xff\xd8")
-                    end = buf.find(b"\xff\xd9", start + 2)
-                    if start < 0 or end < 0:
-                        break
-                    jpeg = buf[start:end + 2]
-                    buf = buf[end + 2:]
-                    with self.cond:
-                        self.frame = jpeg
-                        self.frame_id += 1
-                        self.cond.notify_all()
+            for jpeg in iter_jpeg_frames(self.proc.stdout):
+                with self.cond:
+                    self.frame = jpeg
+                    self.frame_id += 1
+                    self.cond.notify_all()
         finally:
             self.proc.wait()
             self.proc = None
@@ -203,6 +134,22 @@ class CameraStream:
             time.sleep(1)
 
 
+def recent_events(cameras):
+    """Newest person_watch.py events of each camera, newest first overall."""
+    files = []
+    for cam in cameras:
+        # ids are sortable timestamps
+        files.extend(sorted((EVENTS_DIR / cam).glob("*.json"), reverse=True)[:EVENTS_PER_CAMERA])
+    files.sort(key=lambda p: p.stem, reverse=True)
+    events = []
+    for path in files:
+        try:
+            events.append(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            continue  # being written right now; picked up on the next poll
+    return events
+
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -210,52 +157,181 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>kuku-cam-spy</title>
 <style>
-  body {{ margin: 0; background: #111; color: #ddd; font-family: system-ui, sans-serif; }}
-  header {{ padding: 10px 16px; font-weight: 600; }}
-  main {{ display: grid; gap: 8px; padding: 0 8px 8px;
-          grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr)); }}
-  figure {{ margin: 0; background: #000; position: relative; cursor: zoom-in; }}
-  figure img {{ display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; }}
-  figcaption {{ position: absolute; top: 6px; left: 8px; padding: 2px 6px;
-                background: rgba(0,0,0,.6); border-radius: 4px; font-size: 14px; }}
-  figure:fullscreen {{ cursor: zoom-out; display: flex; align-items: center; }}
-  figure:fullscreen img {{ height: 100%; aspect-ratio: auto; }}
+  :root { --bg: #111; --fg: #ddd; --muted: #888; --card: #1b1b1b; --alert: #e5484d; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
+  header h1 { font-size: 16px; margin: 0; flex: 1; }
+  button { background: #2a2a2a; color: var(--fg); border: 1px solid #444; border-radius: 6px;
+           padding: 4px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+  #live { display: grid; gap: 16px 8px; padding: 0 8px 16px; align-items: start;
+          grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr)); }
+  #live figure { margin: 0; background: #000; position: relative; cursor: zoom-in;
+                 outline: 3px solid transparent; transition: outline-color .2s; }
+  #live figure.alert { outline-color: var(--alert); }
+  #live figure img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; }
+  figcaption { position: absolute; top: 6px; left: 8px; padding: 2px 6px;
+               background: rgba(0,0,0,.6); border-radius: 4px; font-size: 14px; }
+  #live figure.alert figcaption::after { content: " · PERSON"; color: var(--alert); font-weight: 700; }
+  #live figure:fullscreen { cursor: zoom-out; display: flex; align-items: center; }
+  #live figure:fullscreen img { height: 100%; aspect-ratio: auto; }
+  .cam { min-width: 0; }
+  .strip { display: flex; gap: 6px; overflow-x: auto; padding: 6px 0 4px; scroll-snap-type: x proximity; }
+  .strip .none { color: var(--muted); font-size: 13px; margin: 4px 0; }
+  .event { flex: none; width: 168px; background: var(--card); border-radius: 6px; overflow: hidden;
+           cursor: pointer; scroll-snap-align: start; }
+  .event img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: #000; }
+  .event div { padding: 4px 8px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .event .meta { color: var(--muted); font-size: 12px; padding-top: 0; }
+  .event.active { outline: 2px solid var(--alert); outline-offset: -2px; }
+  #toast { position: fixed; right: 16px; bottom: 16px; max-width: min(320px, calc(100% - 32px));
+           background: var(--alert); color: #fff; border-radius: 8px; padding: 10px 14px;
+           box-shadow: 0 4px 16px rgba(0,0,0,.5); cursor: pointer; display: none; }
+  dialog { background: #000; border: 0; padding: 0; max-width: 95vw; max-height: 95vh; }
+  dialog::backdrop { background: rgba(0,0,0,.8); }
+  dialog video, dialog img { display: block; max-width: 95vw; max-height: 90vh; }
+  dialog p { margin: 0; padding: 6px 10px; color: var(--fg); font-size: 13px; background: #111; }
 </style>
 </head>
 <body>
-<header>kuku-cam-spy — live</header>
-<main>
-{tiles}
+<header>
+  <h1>kuku-cam-spy</h1>
+  <button id="notify-btn" hidden>Enable desktop notifications</button>
+</header>
+<main id="live">
+__TILES__
 </main>
+<div id="toast"></div>
+<dialog id="viewer"><div id="viewer-media"></div><p id="viewer-caption"></p></dialog>
 <script>
-  for (const fig of document.querySelectorAll("figure")) {{
+  const tiles = {};
+  for (const cam of document.querySelectorAll("#live .cam")) {
+    const fig = cam.querySelector("figure");
+    tiles[cam.dataset.cam] = { fig, strip: cam.querySelector(".strip") };
     const img = fig.querySelector("img");
     // Reconnect if the stream drops (camera reboot, server restart, ...).
-    img.addEventListener("error", () => setTimeout(() => {{
+    img.addEventListener("error", () => setTimeout(() => {
       img.src = img.dataset.src + "?t=" + Date.now();
-    }}, 3000));
+    }, 3000));
     fig.addEventListener("click", () => document.fullscreenElement
       ? document.exitFullscreen() : fig.requestFullscreen());
-  }}
+  }
+
+  const fileUrl = (e, name) => `/events/${encodeURIComponent(e.camera)}/${encodeURIComponent(name)}`;
+  const when = e => new Date(e.start).toLocaleString();
+  const duration = e => e.end ? Math.round((new Date(e.end) - new Date(e.start)) / 1000) + "s" : "ongoing";
+
+  const viewer = document.getElementById("viewer");
+  viewer.addEventListener("click", ev => { if (ev.target === viewer) viewer.close(); });
+  viewer.addEventListener("close", () => document.getElementById("viewer-media").replaceChildren());
+  function openEvent(e) {
+    const media = document.createElement(e.clip ? "video" : "img");
+    media.src = fileUrl(e, e.clip || e.snapshot);
+    if (e.clip) { media.controls = true; media.autoplay = true; media.poster = fileUrl(e, e.snapshot); }
+    document.getElementById("viewer-media").replaceChildren(media);
+    document.getElementById("viewer-caption").textContent =
+      `${e.camera} · ${when(e)} · ${duration(e)} · ${e.clip ? "clip" : e.status === "saving" ? "clip being saved…" : "no clip"}`;
+    viewer.showModal();
+  }
+
+  const toast = document.getElementById("toast");
+  let toastTimer;
+  function alertEvent(e) {
+    toast.textContent = `Person detected on ${e.camera} at ${new Date(e.start).toLocaleTimeString()}`;
+    toast.onclick = () => { toast.style.display = "none"; openEvent(e); };
+    toast.style.display = "block";
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.style.display = "none", 15000);
+    if ("Notification" in window && Notification.permission === "granted") {
+      const n = new Notification(`Person on ${e.camera}`, { body: when(e), icon: fileUrl(e, e.snapshot), tag: e.camera });
+      n.onclick = () => { window.focus(); openEvent(e); };
+    }
+  }
+
+  const btn = document.getElementById("notify-btn");
+  if ("Notification" in window && window.isSecureContext && Notification.permission === "default") {
+    btn.hidden = false;
+    btn.onclick = () => Notification.requestPermission().then(() => btn.hidden = true);
+  }
+
+  const time = e => new Date(e.start).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const day = e => {
+    const d = new Date(e.start), today = new Date();
+    return d.toDateString() === today.toDateString() ? "" : d.toLocaleDateString([], { day: "numeric", month: "short" }) + " ";
+  };
+
+  function card(e) {
+    const el = document.createElement("article");
+    el.className = "event" + (e.status === "active" ? " active" : "");
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.src = fileUrl(e, e.snapshot);
+    const title = document.createElement("div");
+    title.textContent = `${day(e)}${time(e)} · ${duration(e)}`;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `${e.people} person(s) · ${Math.round(e.score * 100)}% · ` +
+      ({ active: "in progress", saving: "saving clip…", interrupted: "interrupted" }[e.status] || (e.clip ? "▶ clip" : "snapshot"));
+    el.title = `${e.camera} · ${when(e)}`;
+    el.append(img, title, meta);
+    el.onclick = () => openEvent(e);
+    return el;
+  }
+
+  function render(events) {
+    for (const [cam, { strip }] of Object.entries(tiles)) {
+      const mine = events.filter(e => e.camera === cam);
+      if (mine.length) {
+        strip.replaceChildren(...mine.map(card));
+      } else {
+        const none = document.createElement("p");
+        none.className = "none";
+        none.textContent = "No person events yet";
+        strip.replaceChildren(none);
+      }
+    }
+  }
+
+  let known = null, lastJson = "";
+  async function poll() {
+    try {
+      const text = await (await fetch("/api/events", { cache: "no-store" })).text();
+      if (text !== lastJson) {
+        lastJson = text;
+        const events = JSON.parse(text);
+        const active = new Set(events.filter(e => e.status === "active").map(e => e.camera));
+        for (const [cam, { fig }] of Object.entries(tiles)) fig.classList.toggle("alert", active.has(cam));
+        const key = e => e.camera + "/" + e.id;
+        if (known) for (const e of events) if (!known.has(key(e)) && e.status === "active") alertEvent(e);
+        known = new Set(events.map(key));
+        render(events);
+      }
+    } catch (err) { /* server restarting; retry */ }
+    setTimeout(poll, 3000);
+  }
+  poll();
 </script>
 </body>
 </html>
 """
 
-TILE = """<figure><img src="/stream/{name}" data-src="/stream/{name}" alt="{name}"><figcaption>{name}</figcaption></figure>"""
+TILE = """<section class="cam" data-cam="{name}">
+<figure><img src="/stream/{url}" data-src="/stream/{url}" alt="{name}"><figcaption>{name}</figcaption></figure>
+<div class="strip"><p class="none">No person events yet</p></div>
+</section>"""
 
 
 def make_handler(streams):
-    page = PAGE.format(
-        tiles="\n".join(TILE.format(name=html.escape(n, quote=True)) for n in streams)
-    ).encode()
+    page = PAGE.replace("__TILES__", "\n".join(
+        TILE.format(name=html.escape(n, quote=True), url=quote(n, safe="")) for n in streams
+    )).encode()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
 
         def do_GET(self):
-            path = self.path.split("?", 1)[0]
+            parts = [unquote(p) for p in self.path.split("?", 1)[0].split("/")]
+            path = "/".join(parts)
             if path == "/":
                 self._send(200, "text/html; charset=utf-8", page)
             elif path.startswith("/stream/") and path[8:] in streams:
@@ -263,6 +339,12 @@ def make_handler(streams):
             elif path.startswith("/snapshot/") and path.endswith(".jpg") \
                     and path[10:-4] in streams:
                 self._snapshot(streams[path[10:-4]])
+            elif path == "/api/events":
+                body = json.dumps(recent_events(streams)).encode()
+                self._send(200, "application/json", body)
+            elif len(parts) == 4 and parts[1] == "events" and parts[2] in streams \
+                    and EVENT_FILE_RE.match(parts[3]):
+                self._file(EVENTS_DIR / parts[2] / parts[3])
             else:
                 self._send(404, "text/plain", b"not found\n")
 
@@ -273,6 +355,48 @@ def make_handler(streams):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _file(self, path):
+            """Serve an event file, with single-range support so clips can seek."""
+            try:
+                f = open(path, "rb")
+            except OSError:
+                self._send(404, "text/plain", b"not found\n")
+                return
+            with f:
+                size = path.stat().st_size
+                start, end, status = 0, size - 1, 200
+                m = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+                if m and (m[1] or m[2]):
+                    if m[1]:
+                        start, end = int(m[1]), int(m[2]) if m[2] else size - 1
+                    else:
+                        start = max(size - int(m[2]), 0)
+                    end = min(end, size - 1)
+                    if start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    status = 206
+                self.send_response(status)
+                self.send_header("Content-Type", CONTENT_TYPES[path.suffix[1:]])
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Accept-Ranges", "bytes")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                f.seek(start)
+                remaining = end - start + 1
+                try:
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
 
         def _snapshot(self, stream):
             stream.subscribe()
@@ -322,10 +446,7 @@ def main():
     port = int(config.get("stream_port", 8080))
     server = ThreadingHTTPServer((bind, port), make_handler(streams))
     server.daemon_threads = True
-
-    RUN_DIR.mkdir(exist_ok=True)
-    pid_file = RUN_DIR / "stream_server.pid"
-    pid_file.write_text(str(os.getpid()))
+    pid_file = write_pid_file("stream_server")
 
     def handle_signal(signum, frame):
         log("main", "stopping...")

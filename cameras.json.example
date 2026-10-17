@@ -8,6 +8,17 @@
   "stream_port": 8080,
   "stream_fps": 5,
   "stream_width": 1280,
+  "detect_fps": 2,
+  "detect_min_score": 0.6,
+  "detect_min_frames": 2,
+  "event_end_seconds": 10,
+  "event_max_seconds": 120,
+  "clip_enabled": true,
+  "clip_pre_seconds": 5,
+  "telegram_enabled": false,
+  "telegram_bot_token_env": "TELEGRAM_BOT_TOKEN",
+  "telegram_chat_id": "123456789",
+  "telegram_send_clip": true,
   "cameras": [
     {
       "name": "front_door",
@@ -17,7 +28,8 @@
       "username": "admin",
       "password": "CHANGEME",
       "password_env": null,
-      "path": "/Streaming/Channels/101"
+      "path": "/Streaming/Channels/101",
+      "person_detection": false
     },
     {
       "name": "backyard",
@@ -27,7 +39,9 @@
       "username": "admin",
       "password": null,
       "password_env": "CAM_BACKYARD_PASSWORD",
-      "path": "/Streaming/Channels/101"
+      "path": "/Streaming/Channels/101",
+      "stream_path": "/Streaming/Channels/102",
+      "telegram_enabled": true
     },
     {
       "name": "puerta_verde",
