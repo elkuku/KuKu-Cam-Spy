@@ -1,0 +1,47 @@
+{
+  "retention_days": 7,
+  "segment_seconds": 900,
+  "rtsp_transport": "tcp",
+  "tapo_cloud_password_env": "TAPO_CLOUD_PASSWORD",
+  "motion_poll_seconds": 5,
+  "stream_bind": "127.0.0.1",
+  "stream_port": 8080,
+  "stream_fps": 5,
+  "stream_width": 1280,
+  "cameras": [
+    {
+      "name": "front_door",
+      "enabled": true,
+      "host": "192.168.1.50",
+      "port": 554,
+      "username": "admin",
+      "password": "CHANGEME",
+      "password_env": null,
+      "path": "/Streaming/Channels/101"
+    },
+    {
+      "name": "backyard",
+      "enabled": true,
+      "host": "192.168.1.51",
+      "port": 554,
+      "username": "admin",
+      "password": null,
+      "password_env": "CAM_BACKYARD_PASSWORD",
+      "path": "/Streaming/Channels/101"
+    },
+    {
+      "name": "puerta_verde",
+      "enabled": true,
+      "host": "192.168.1.52",
+      "port": 554,
+      "username": "admin",
+      "password": null,
+      "password_env": "CAM_PUERTA_VERDE_PASSWORD",
+      "path": "/stream1",
+      "stream_path": "/stream2",
+      "tapo_cloud_password_env": "TAPO_CLOUD_PASSWORD",
+      "motion_poll_seconds": 5,
+      "snapshot_on_motion": true
+    }
+  ]
+}

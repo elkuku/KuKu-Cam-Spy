@@ -1,0 +1,9 @@
+cameras.json
+recordings/
+snapshots/
+run/
+*.log
+.venv/
+__pycache__/
+*.pyc
+.idea/
