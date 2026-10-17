@@ -163,6 +163,8 @@ PAGE = """<!doctype html>
   header h1 { font-size: 16px; margin: 0; flex: 1; }
   button { background: #2a2a2a; color: var(--fg); border: 1px solid #444; border-radius: 6px;
            padding: 4px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+  select { background: #2a2a2a; color: var(--fg); border: 1px solid #444; border-radius: 6px;
+           padding: 3px 6px; font: inherit; font-size: 13px; }
   #live { display: grid; gap: 16px 8px; padding: 0 8px 16px; align-items: start;
           grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr)); }
   #live figure { margin: 0; background: #000; position: relative; cursor: zoom-in;
@@ -171,7 +173,7 @@ PAGE = """<!doctype html>
   #live figure img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; }
   figcaption { position: absolute; top: 6px; left: 8px; padding: 2px 6px;
                background: rgba(0,0,0,.6); border-radius: 4px; font-size: 14px; }
-  #live figure.alert figcaption::after { content: " · PERSON"; color: var(--alert); font-weight: 700; }
+  #live figure.alert figcaption::after { content: " · " attr(data-alert); color: var(--alert); font-weight: 700; }
   #live figure:fullscreen { cursor: zoom-out; display: flex; align-items: center; }
   #live figure:fullscreen img { height: 100%; aspect-ratio: auto; }
   .cam { min-width: 0; }
@@ -195,7 +197,12 @@ PAGE = """<!doctype html>
 <body>
 <header>
   <h1>kuku-cam-spy</h1>
-  <button id="notify-btn" hidden>Enable desktop notifications</button>
+  <button id="notify-btn" data-i18n="enableNotifications" hidden>Enable desktop notifications</button>
+  <select id="lang" aria-label="Language">
+    <option value="en">English</option>
+    <option value="de">Deutsch</option>
+    <option value="es">Español</option>
+  </select>
 </header>
 <main id="live">
 __TILES__
@@ -203,6 +210,87 @@ __TILES__
 <div id="toast"></div>
 <dialog id="viewer"><div id="viewer-media"></div><p id="viewer-caption"></p></dialog>
 <script>
+  const I18N = {
+    en: {
+      enableNotifications: "Enable desktop notifications",
+      noEvents: "No person events yet",
+      personBadge: "PERSON",
+      people: n => n === 1 ? "1 person" : `${n} people`,
+      detected: (cam, time) => `Person detected on ${cam} at ${time}`,
+      notifyTitle: cam => `Person on ${cam}`,
+      ongoing: "ongoing",
+      active: "in progress",
+      saving: "saving clip…",
+      interrupted: "interrupted",
+      clip: "▶ clip",
+      snapshot: "snapshot",
+      captionClip: "clip",
+      captionSaving: "clip being saved…",
+      captionNoClip: "no clip",
+    },
+    de: {
+      enableNotifications: "Desktop-Benachrichtigungen aktivieren",
+      noEvents: "Noch keine Personen erkannt",
+      personBadge: "PERSON",
+      people: n => n === 1 ? "1 Person" : `${n} Personen`,
+      detected: (cam, time) => `Person erkannt: ${cam} um ${time}`,
+      notifyTitle: cam => `Person bei ${cam}`,
+      ongoing: "läuft",
+      active: "läuft",
+      saving: "Clip wird gespeichert…",
+      interrupted: "unterbrochen",
+      clip: "▶ Clip",
+      snapshot: "Standbild",
+      captionClip: "Clip",
+      captionSaving: "Clip wird gespeichert…",
+      captionNoClip: "kein Clip",
+    },
+    es: {
+      enableNotifications: "Activar notificaciones de escritorio",
+      noEvents: "Aún no se detectaron personas",
+      personBadge: "PERSONA",
+      people: n => n === 1 ? "1 persona" : `${n} personas`,
+      detected: (cam, time) => `Persona detectada en ${cam} a las ${time}`,
+      notifyTitle: cam => `Persona en ${cam}`,
+      ongoing: "en curso",
+      active: "en curso",
+      saving: "guardando clip…",
+      interrupted: "interrumpido",
+      clip: "▶ clip",
+      snapshot: "captura",
+      captionClip: "clip",
+      captionSaving: "guardando clip…",
+      captionNoClip: "sin clip",
+    },
+  };
+
+  function pickLang() {
+    try {
+      const saved = localStorage.getItem("lang");
+      if (saved in I18N) return saved;
+    } catch (err) { /* storage blocked */ }
+    for (const l of navigator.languages || [navigator.language]) {
+      const base = (l || "").slice(0, 2).toLowerCase();
+      if (base in I18N) return base;
+    }
+    return "en";
+  }
+  let lang = pickLang();
+  const t = key => I18N[lang][key];
+
+  function applyLang() {
+    document.documentElement.lang = lang;
+    document.getElementById("lang").value = lang;
+    for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+    for (const fig of document.querySelectorAll("#live figure")) fig.dataset.alert = t("personBadge");
+  }
+  document.getElementById("lang").addEventListener("change", ev => {
+    lang = ev.target.value;
+    try { localStorage.setItem("lang", lang); } catch (err) { /* storage blocked */ }
+    applyLang();
+    if (lastEvents) render(lastEvents);
+  });
+
   const tiles = {};
   for (const cam of document.querySelectorAll("#live .cam")) {
     const fig = cam.querySelector("figure");
@@ -217,8 +305,9 @@ __TILES__
   }
 
   const fileUrl = (e, name) => `/events/${encodeURIComponent(e.camera)}/${encodeURIComponent(name)}`;
-  const when = e => new Date(e.start).toLocaleString();
-  const duration = e => e.end ? Math.round((new Date(e.end) - new Date(e.start)) / 1000) + "s" : "ongoing";
+  const pct = x => new Intl.NumberFormat(lang, { style: "percent" }).format(x);
+  const when = e => new Date(e.start).toLocaleString(lang);
+  const duration = e => e.end ? Math.round((new Date(e.end) - new Date(e.start)) / 1000) + " s" : t("ongoing");
 
   const viewer = document.getElementById("viewer");
   viewer.addEventListener("click", ev => { if (ev.target === viewer) viewer.close(); });
@@ -229,20 +318,20 @@ __TILES__
     if (e.clip) { media.controls = true; media.autoplay = true; media.poster = fileUrl(e, e.snapshot); }
     document.getElementById("viewer-media").replaceChildren(media);
     document.getElementById("viewer-caption").textContent =
-      `${e.camera} · ${when(e)} · ${duration(e)} · ${e.clip ? "clip" : e.status === "saving" ? "clip being saved…" : "no clip"}`;
+      `${e.camera} · ${when(e)} · ${duration(e)} · ${t(e.clip ? "captionClip" : e.status === "saving" ? "captionSaving" : "captionNoClip")}`;
     viewer.showModal();
   }
 
   const toast = document.getElementById("toast");
   let toastTimer;
   function alertEvent(e) {
-    toast.textContent = `Person detected on ${e.camera} at ${new Date(e.start).toLocaleTimeString()}`;
+    toast.textContent = t("detected")(e.camera, new Date(e.start).toLocaleTimeString(lang));
     toast.onclick = () => { toast.style.display = "none"; openEvent(e); };
     toast.style.display = "block";
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => toast.style.display = "none", 15000);
     if ("Notification" in window && Notification.permission === "granted") {
-      const n = new Notification(`Person on ${e.camera}`, { body: when(e), icon: fileUrl(e, e.snapshot), tag: e.camera });
+      const n = new Notification(t("notifyTitle")(e.camera), { body: when(e), icon: fileUrl(e, e.snapshot), tag: e.camera });
       n.onclick = () => { window.focus(); openEvent(e); };
     }
   }
@@ -253,10 +342,10 @@ __TILES__
     btn.onclick = () => Notification.requestPermission().then(() => btn.hidden = true);
   }
 
-  const time = e => new Date(e.start).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const time = e => new Date(e.start).toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const day = e => {
     const d = new Date(e.start), today = new Date();
-    return d.toDateString() === today.toDateString() ? "" : d.toLocaleDateString([], { day: "numeric", month: "short" }) + " ";
+    return d.toDateString() === today.toDateString() ? "" : d.toLocaleDateString(lang, { day: "numeric", month: "short" }) + " ";
   };
 
   function card(e) {
@@ -269,8 +358,8 @@ __TILES__
     title.textContent = `${day(e)}${time(e)} · ${duration(e)}`;
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = `${e.people} person(s) · ${Math.round(e.score * 100)}% · ` +
-      ({ active: "in progress", saving: "saving clip…", interrupted: "interrupted" }[e.status] || (e.clip ? "▶ clip" : "snapshot"));
+    const status = ["active", "saving", "interrupted"].includes(e.status) ? e.status : e.clip ? "clip" : "snapshot";
+    meta.textContent = `${t("people")(e.people)} · ${pct(e.score)} · ${t(status)}`;
     el.title = `${e.camera} · ${when(e)}`;
     el.append(img, title, meta);
     el.onclick = () => openEvent(e);
@@ -285,19 +374,20 @@ __TILES__
       } else {
         const none = document.createElement("p");
         none.className = "none";
-        none.textContent = "No person events yet";
+        none.dataset.i18n = "noEvents";
+        none.textContent = t("noEvents");
         strip.replaceChildren(none);
       }
     }
   }
 
-  let known = null, lastJson = "";
+  let known = null, lastJson = "", lastEvents = null;
   async function poll() {
     try {
       const text = await (await fetch("/api/events", { cache: "no-store" })).text();
       if (text !== lastJson) {
         lastJson = text;
-        const events = JSON.parse(text);
+        const events = lastEvents = JSON.parse(text);
         const active = new Set(events.filter(e => e.status === "active").map(e => e.camera));
         for (const [cam, { fig }] of Object.entries(tiles)) fig.classList.toggle("alert", active.has(cam));
         const key = e => e.camera + "/" + e.id;
@@ -308,6 +398,7 @@ __TILES__
     } catch (err) { /* server restarting; retry */ }
     setTimeout(poll, 3000);
   }
+  applyLang();
   poll();
 </script>
 </body>
@@ -316,7 +407,7 @@ __TILES__
 
 TILE = """<section class="cam" data-cam="{name}">
 <figure><img src="/stream/{url}" data-src="/stream/{url}" alt="{name}"><figcaption>{name}</figcaption></figure>
-<div class="strip"><p class="none">No person events yet</p></div>
+<div class="strip"><p class="none" data-i18n="noEvents">No person events yet</p></div>
 </section>"""
 
 
